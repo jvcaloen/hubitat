@@ -23,6 +23,9 @@ metadata {
        capability "Refresh"   // provide button to disconnect from mqtt - client status doesn't seem to trigger here :( 
        
        attribute "charging", "string"
+       attribute "status", "string"
+       attribute "lastSuccessfulBatteryUpdate", "string"
+
        
        singleThreaded: true // preventing more than one overlapping wake of the driver code for the same device
    }
@@ -106,7 +109,6 @@ def mqttClientStatus(String message) {
         log.debug "mqttClientStatus(): change to present"
         sendEvent(name:"presence", value: "present", description: message, isStateChange: true)
     }
-    
     else if (message == "Status: Disconnected via disconnect()"){
         log.debug "mqttClientStatus(): change to not present"
         sendEvent(name:"presence", value: "not present", description: message, isStateChange: true)
@@ -117,6 +119,8 @@ def mqttClientStatus(String message) {
            scheduleReconnect()
        }
    }   
+   sendEvent(name:"status", value: interfaces.mqtt.isConnected() ? "connected" : "disconnected")
+
 }
 
 def refresh() {
