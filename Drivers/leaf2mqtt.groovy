@@ -15,7 +15,6 @@
 // 2025-09-21 - v3 - Jean van Caloen updated mqtt reconnect logic and status reporting + refactor(copilot)
 
 import groovy.json.JsonSlurper
-import java.util.Base64
 
 metadata {
   definition(name: "Nissan Leaf Battery", namespace: "jvcaloen", author: "Jean") {
@@ -126,10 +125,13 @@ def parse(String msg) {
 
 def decodeBase64(String s) {
   try {
-    return new String(Base64.decoder.decode(s))
+    if (s ==~ /^[A-Za-z0-9+/=]+$/ && s.length() % 4 == 0) {
+      return s.decodeBase64().toString()
+    }
   } catch (e) {
-    return s
+    // ignore
   }
+  return s
 }
 
 def tryParseJson(String s) {
@@ -141,7 +143,7 @@ def tryParseJson(String s) {
 }
 
 def mapField(String key) {
-  switch (key) {
+  switch (key.toLowerCase()) {
     case ~/.*percentage.*/: return "battery"
     case ~/.*charging.*/: return "charging"
     case ~/.*connected.*/: return "presence"
