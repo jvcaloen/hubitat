@@ -12,7 +12,7 @@
 //
 // 2024-07-03 - v1 - Jean van Caloen simple battery percentage & last update time in state
 // 2024-11-24 - v2 - Jean van Caloen added reconnect and keepalive to avoid mqtt connection dropping
-//
+// 2025-09-21 - v3 - Jean van Caloen updated mqtt reconnect logic and status reporting
 
 metadata {
    definition (name: "Nissan Leaf Battery", namespace: "jvcaloen", author: "Jean") {
@@ -54,9 +54,13 @@ def parse(String message) {
     // log.debug "parse() received: ${message}"
     mapped = interfaces.mqtt.parseMessage(message)
     log.debug "parse() mapped: ${mapped}"
-    if (mapped.topic == "leaf/battery/percentage") { 
-        sendEvent(name:"battery", value: mapped.payload, unit: "%")
+   
+    if (mapped.topic == "leaf/battery/percentage") {
+       def value = mapped.payload?.isNumber() ? mapped.payload.toInteger() : -1
+       sendEvent(name:"battery", value: value, unit: "%")
+       state.lastSuccessfulBatteryUpdate = now()
     }
+
     if (mapped.topic == "leaf/battery/lastUpdatedDateTimeUtc") {
         state.lastUpdatedDateTimeUtc = toDateTime(mapped.payload)
     }
@@ -77,6 +81,24 @@ def updated() {
    log.debug "updated()"
 }
 
+def scheduleReconnect(attempt = 1) {
+    def delay = Math.min(60 * attempt, 600) // max 10 minuten
+    log.debug "MQTT reconnect attempt ${attempt} in ${delay}s"
+    runIn(delay, "retryInitialize", [overwrite: true])
+    state.reconnectAttempt = attempt
+}
+
+def retryInitialize() {
+    if (!interfaces.mqtt.isConnected()) {
+        log.debug "MQTT still disconnected, retrying initialize"
+        initialize()
+        scheduleReconnect((state.reconnectAttempt ?: 1) + 1)
+    } else {
+        log.debug "MQTT reconnected successfully"
+        state.reconnectAttempt = 0
+    }
+}
+
 def mqttClientStatus(String message) {
     log.debug "mqttClientStatus() message: ${message}"
 
@@ -89,19 +111,12 @@ def mqttClientStatus(String message) {
         log.debug "mqttClientStatus(): change to not present"
         sendEvent(name:"presence", value: "not present", description: message, isStateChange: true)
     }
-    else 
-    {
-        
-        if(!(interfaces.mqtt.isConnected())) {
-            log.debug "mqttClientStatus(): change to not present"
-            sendEvent(name:"presence", value: "not present", description: message, isStateChange: true)
-         
-            // pause + reconnect 
-            runIn(60, "initialize")
-            log.debug "initialize planned in 60s"
-        }
-    }
-    
+    else {
+       if (!(interfaces.mqtt.isConnected())) {
+           sendEvent(name:"presence", value: "not present", description: message, isStateChange: true)
+           scheduleReconnect()
+       }
+   }   
 }
 
 def refresh() {
@@ -121,4 +136,10 @@ void keepalive() {
         interfaces.mqtt.publish("hubitat-leaf-driver/keepalive", (String)now())
         runIn(300, "keepalive")
     }
+   def maxAge = 60 * 60 * 1000 // 60 minuten
+   if (state.lastSuccessfulBatteryUpdate && (now() - state.lastSuccessfulBatteryUpdate > maxAge)) {
+       log.warn "Battery data stale, setting battery to -1%"
+       sendEvent(name:"battery", value: -1, unit: "%")
+   }
+
 }
