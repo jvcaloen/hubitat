@@ -12,7 +12,10 @@
 //
 // 2024-07-03 - v1 - Jean van Caloen simple battery percentage & last update time in state
 // 2024-11-24 - v2 - Jean van Caloen added reconnect and keepalive to avoid mqtt connection dropping
-// 2025-09-21 - v3 - Jean van Caloen updated mqtt reconnect logic and status reporting
+// 2025-09-21 - v3 - Jean van Caloen updated mqtt reconnect logic and status reporting + refactor(copilot)
+
+import groovy.json.JsonSlurper
+import java.util.Base64
 
 metadata {
   definition(name: "Nissan Leaf Battery", namespace: "jvcaloen", author: "Jean") {
@@ -27,28 +30,18 @@ metadata {
     attribute "lastSuccessfulBatteryUpdate", "string"
   }
   preferences {
-    input "mqttUrl", "text", title: "MQTT URI (e.g. tcp://10.0.0.1:1883)", required: true
+    input "mqttUrl", "text", title: "MQTT URI", required: true
     input "mqttUsername", "text", title: "MQTT Username"
     input "mqttPassword", "text", title: "MQTT Password"
   }
 }
 
-def installed() {
-  initialize()
-}
-
-def updated() {
-  initialize()
-}
+def installed() { initialize() }
+def updated() { initialize() }
 
 def initialize() {
   unschedule()
-  try {
-    interfaces.mqtt.disconnect()
-  } catch (e) {
-    log.warn "MQTT disconnect failed: ${e}"
-  }
-
+  try { interfaces.mqtt.disconnect() } catch (e) { log.warn "MQTT disconnect failed: ${e}" }
   def clientId = "leaf-${device.id}"
   try {
     interfaces.mqtt.connect(mqttUrl, clientId, mqttUsername, mqttPassword)
@@ -99,23 +92,61 @@ def retryInitialize() {
 
 def parse(String msg) {
   def parts = msg.split(" ", 2)
-  def topic = parts[0].trim()
-  def payload = parts.length > 1 ? parts[1].trim() : ""
+  def rawTopic = parts[0]?.trim()
+  def rawPayload = parts.length > 1 ? parts[1]?.trim() : ""
 
-  switch (topic) {
-    case "leaf/battery/percentage":
-      def value = payload.isNumber() ? payload.toInteger() : -1
-      sendEvent(name: "battery", value: value, unit: "%")
-      state.lastSuccessfulBatteryUpdate = now()
-      sendEvent(name: "lastSuccessfulBatteryUpdate", value: new Date().format("yyyy-MM-dd HH:mm:ss"))
-      break
+  def topic = decodeBase64(rawTopic)
+  def payload = decodeBase64(rawPayload)
 
-    case "leaf/charging":
-      sendEvent(name: "charging", value: payload)
-      break
-
-    default:
+  def json = tryParseJson(payload)
+  if (json) {
+    json.each { k, v ->
+      def attr = mapField(k)
+      if (attr) {
+        def value = v.toString()
+        sendEvent(name: attr, value: value)
+        if (attr == "battery") {
+          state.lastSuccessfulBatteryUpdate = now()
+          sendEvent(name: "lastSuccessfulBatteryUpdate", value: new Date().format("yyyy-MM-dd HH:mm:ss"))
+        }
+      } else {
+        log.debug "Unhandled JSON field: ${k} -> ${v}"
+      }
+    }
+  } else {
+    def attr = mapField(topic)
+    if (attr) {
+      def value = payload.isNumber() ? payload.toInteger() : payload
+      sendEvent(name: attr, value: value)
+    } else {
       log.debug "Unhandled topic: ${topic} -> ${payload}"
+    }
+  }
+}
+
+def decodeBase64(String s) {
+  try {
+    return new String(Base64.decoder.decode(s))
+  } catch (e) {
+    return s
+  }
+}
+
+def tryParseJson(String s) {
+  try {
+    return new JsonSlurper().parseText(s)
+  } catch (e) {
+    return null
+  }
+}
+
+def mapField(String key) {
+  switch (key) {
+    case ~/.*percentage.*/: return "battery"
+    case ~/.*charging.*/: return "charging"
+    case ~/.*connected.*/: return "presence"
+    case ~/.*status.*/: return "status"
+    default: return null
   }
 }
 
@@ -130,3 +161,4 @@ def keepalive() {
     scheduleReconnect((state.reconnectAttempt ?: 1))
   }
 }
+
