@@ -14,8 +14,6 @@
 // 2024-11-24 - v2 - Jean van Caloen added reconnect and keepalive to avoid mqtt connection dropping
 // 2025-09-21 - v3 - Jean van Caloen updated mqtt reconnect logic and status reporting + refactor(copilot)
 
-import groovy.json.JsonSlurper
-
 metadata {
   definition(name: "Nissan Leaf Battery", namespace: "jvcaloen", author: "Jean") {
     capability "Battery"
@@ -23,6 +21,9 @@ metadata {
     capability "PresenceSensor"
     capability "Initialize"
     capability "Refresh"
+    capability "Configuration" // Enables built-in Configure button
+
+    command "resetAttributes"
 
     attribute "charging", "string"
     attribute "status", "string"
@@ -40,22 +41,41 @@ def updated() { initialize() }
 
 def initialize() {
   unschedule()
+  sendEvent(name: "status", value: "initializing")
+  sendEvent(name: "presence", value: "unknown")
   try { interfaces.mqtt.disconnect() } catch (e) { log.warn "MQTT disconnect failed: ${e}" }
   def clientId = "leaf-${device.id}"
   try {
     interfaces.mqtt.connect(mqttUrl, clientId, mqttUsername, mqttPassword)
-    interfaces.mqtt.subscribe("leaf/#")
-    sendEvent(name: "status", value: "connecting")
+    interfaces.mqtt.unsubscribe("leaf/#")
+    interfaces.mqtt.subscribe("leaf/battery/percentage")
+    interfaces.mqtt.subscribe("leaf/battery/charging")
+    interfaces.mqtt.subscribe("leaf/battery/lastUpdatedDateTimeUtc")
+    mqttClientStatus("Connected")
+    keepalive()
   } catch (e) {
     log.error "MQTT connect error: ${e}"
+    mqttClientStatus("Connection lost")
     scheduleReconnect(1)
   }
 }
 
 def refresh() {
-  interfaces.mqtt.disconnect()
-  sendEvent(name: "status", value: "disconnected")
-  sendEvent(name: "presence", value: "not present")
+  log.info "Manual refresh triggered"
+  try {
+    interfaces.mqtt.disconnect()
+    interfaces.mqtt.connect(mqttUrl, "leaf-${device.id}", mqttUsername, mqttPassword)
+    interfaces.mqtt.unsubscribe("leaf/#")
+    interfaces.mqtt.subscribe("leaf/battery/percentage")
+    interfaces.mqtt.subscribe("leaf/battery/charging")
+    interfaces.mqtt.subscribe("leaf/battery/lastUpdatedDateTimeUtc")
+    mqttClientStatus("Connected")
+    keepalive()
+  } catch (e) {
+    log.error "Refresh failed: ${e}"
+    mqttClientStatus("Connection lost")
+    scheduleReconnect(1)
+  }
 }
 
 def mqttClientStatus(message) {
@@ -64,7 +84,6 @@ def mqttClientStatus(message) {
     sendEvent(name: "status", value: "disconnected")
     sendEvent(name: "presence", value: "not present")
     sendEvent(name: "battery", value: -1, unit: "%")
-    scheduleReconnect((state.reconnectAttempt ?: 1))
   } else if (message == "Connected") {
     sendEvent(name: "status", value: "connected")
     sendEvent(name: "presence", value: "present")
@@ -89,78 +108,48 @@ def retryInitialize() {
   }
 }
 
-def parse(String msg) {
-  def parts = msg.split(" ", 2)
-  def rawTopic = parts[0]?.trim()
-  def rawPayload = parts.length > 1 ? parts[1]?.trim() : ""
+def parse(String message) {
+  def mapped = interfaces.mqtt.parseMessage(message)
+  log.debug "parse() topic: ${mapped.topic}, payload: ${mapped.payload}"
 
-  def topic = decodeBase64(rawTopic)
-  def payload = decodeBase64(rawPayload)
-
-  def json = tryParseJson(payload)
-  if (json) {
-    json.each { k, v ->
-      def attr = mapField(k)
-      if (attr) {
-        def value = v.toString()
-        sendEvent(name: attr, value: value)
-        if (attr == "battery") {
-          state.lastSuccessfulBatteryUpdate = now()
-          sendEvent(name: "lastSuccessfulBatteryUpdate", value: new Date().format("yyyy-MM-dd HH:mm:ss"))
-        }
-      } else {
-        log.debug "Unhandled JSON field: ${k} -> ${v}"
-      }
-    }
-  } else {
-    def attr = mapField(topic)
-    if (attr) {
-      def value = payload.isNumber() ? payload.toInteger() : payload
-      sendEvent(name: attr, value: value)
-    } else {
-      log.debug "Unhandled topic: ${topic} -> ${payload}"
-    }
+  switch (mapped.topic) {
+    case "leaf/battery/percentage":
+      sendEvent(name: "battery", value: mapped.payload, unit: "%")
+      sendEvent(name: "lastSuccessfulBatteryUpdate", value: new Date().format("yyyy-MM-dd'T'HH:mm:ss.SSSZ"))
+      break
+    case "leaf/battery/charging":
+      sendEvent(name: "charging", value: mapped.payload)
+      sendEvent(name: "switch", value: mapped.payload)
+      break
+    case "leaf/battery/lastUpdatedDateTimeUtc":
+      sendEvent(name: "lastSuccessfulBatteryUpdate", value: mapped.payload)
+      break
+    default:
+      log.warn "Unhandled topic: ${mapped.topic}"
   }
-}
 
-def decodeBase64(String s) {
-  try {
-    if (s ==~ /^[A-Za-z0-9+/=]+$/ && s.length() % 4 == 0) {
-      return s.decodeBase64().toString()
-    }
-  } catch (e) {
-    // ignore
-  }
-  return s
-}
-
-def tryParseJson(String s) {
-  try {
-    return new JsonSlurper().parseText(s)
-  } catch (e) {
-    return null
-  }
-}
-
-def mapField(String key) {
-  switch (key.toLowerCase()) {
-    case ~/.*percentage.*/: return "battery"
-    case ~/.*charging.*/: return "charging"
-    case ~/.*connected.*/: return "presence"
-    case ~/.*status.*/: return "status"
-    default: return null
-  }
+  keepalive()
 }
 
 def keepalive() {
-  def maxAge = 15 * 60 * 1000
-  if (state.lastSuccessfulBatteryUpdate && (now() - state.lastSuccessfulBatteryUpdate > maxAge)) {
-    log.warn "Battery data stale, setting battery to -1%"
-    sendEvent(name: "battery", value: -1, unit: "%")
-  }
   if (!interfaces.mqtt.isConnected()) {
-    log.warn "MQTT disconnected in keepalive, triggering reconnect"
+    mqttClientStatus("Connection lost")
     scheduleReconnect((state.reconnectAttempt ?: 1))
+  } else {
+    runIn(300, "keepalive")
   }
 }
 
+def resetAttributes() {
+  log.warn "Resetting declared attributes..."
+  sendEvent(name: "charging", value: "")
+  sendEvent(name: "status", value: "")
+  sendEvent(name: "presence", value: "")
+  sendEvent(name: "lastSuccessfulBatteryUpdate", value: "")
+  sendEvent(name: "battery", value: -1, unit: "%")
+}
+
+def configure() {
+  log.warn "Configure button pressed — clearing topic_"
+  sendEvent(name: "topic_", value: "")
+}
